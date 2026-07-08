@@ -35,4 +35,6 @@ def guardian_signal_path() -> Path:
 
 
 def project_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent

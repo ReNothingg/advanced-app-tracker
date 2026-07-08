@@ -21,8 +21,10 @@ def launcher_path() -> str:
 
 
 def launch_command() -> List[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
     return [python_executable(), launcher_path()]
 
 
 def launch_command_string() -> str:
-    return f'"{python_executable()}" "{launcher_path()}"'
+    return " ".join(f'"{part}"' for part in launch_command())

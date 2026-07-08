@@ -52,13 +52,18 @@ class Guardian(QObject):
         except psutil.Error:
             create_time = 0.0
 
-        command = [
-            sys.executable,
-            "-m", "app_tracker.security.guardian_helper",
+        if getattr(sys, "frozen", False):
+            command = [sys.executable, "--guardian-helper"]
+        else:
+            command = [
+                sys.executable,
+                "-m", "app_tracker.security.guardian_helper",
+            ]
+        command.extend([
             str(os.getpid()),
             repr(create_time),
             str(guardian_signal_path()),
-        ]
+        ])
         kwargs = {
             "cwd": str(project_root()),
             "stdin": subprocess.DEVNULL,
