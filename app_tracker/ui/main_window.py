@@ -1,5 +1,3 @@
-"""The main application window, system tray and overall lifecycle."""
-
 from __future__ import annotations
 
 import logging
@@ -27,13 +25,15 @@ from app_tracker.config import (
     SETTING_MINIMIZE_TO_TRAY,
     SETTING_PASSWORD_HASH,
     SETTING_PASSWORD_PROTECT_EXIT,
+    SETTING_TELEGRAM_BOT_TOKEN,
 )
 from app_tracker.core.database import DatabaseManager
 from app_tracker.core.productivity import PRODUCTIVITY_COLORS, Productivity
 from app_tracker.core.tracker import TrackerWorker
+from app_tracker.integrations.telegram_bot import TelegramBotService
 from app_tracker.security import check_password
 from app_tracker.security.guardian import Guardian
-from app_tracker.ui.dialogs import HistoryDialog, LimitDialog, SettingsDialog
+from app_tracker.ui.dialogs import HistoryDialog, LimitDialog, SecretTimeDialog, SettingsDialog
 from app_tracker.ui.graphs import GraphWidget
 from app_tracker.ui.theme import app_icon
 from app_tracker.utils import format_duration
@@ -56,16 +56,23 @@ class MainWindow(QMainWindow):
         self.usage_summary: dict = {}
         self.limits: dict = {}
         self.totals: dict = {}
+        self._row_by_app_id: dict[int, int] = {}
         self._warnings_shown_today: dict[str, set] = defaultdict(set)
+        self._secret_buffer = ""
 
         self.guardian = Guardian(self)
         self._guardian_running = False
+        self.telegram_bot = TelegramBotService(self.db)
 
         self._build_ui()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self._create_actions()
         self._create_menu()
         self._create_tray()
         self._start_worker()
+        self._start_telegram_bot()
 
         self._setup_midnight_timer()
         if self.db.get_bool(SETTING_GUARDIAN_ENABLED):
@@ -214,14 +221,31 @@ class MainWindow(QMainWindow):
         )
 
     def _find_row(self, app_id: int) -> int:
+        row = self._row_by_app_id.get(app_id, -1)
+        if self._row_matches_app(row, app_id):
+            return row
+        self._rebuild_row_index()
+        row = self._row_by_app_id.get(app_id, -1)
+        return row if self._row_matches_app(row, app_id) else -1
+
+    def _row_matches_app(self, row: int, app_id: int) -> bool:
+        if row < 0 or row >= self.table.rowCount():
+            return False
+        item = self.table.item(row, 0)
+        return bool(item and item.data(Qt.ItemDataRole.UserRole) == app_id)
+
+    def _rebuild_row_index(self) -> None:
+        self._row_by_app_id.clear()
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
-            if item and item.data(Qt.ItemDataRole.UserRole) == app_id:
-                return row
-        return -1
+            if item:
+                app_id = item.data(Qt.ItemDataRole.UserRole)
+                if app_id is not None:
+                    self._row_by_app_id[app_id] = row
 
     def _populate_table(self, summary: dict) -> None:
         self.table.setSortingEnabled(False)
+        self._rebuild_row_index()
         active_id = getattr(self.worker, "current_app_id", None)
 
         for app_id, data in summary.items():
@@ -235,6 +259,7 @@ class MainWindow(QMainWindow):
             if row == -1:
                 row = self.table.rowCount()
                 self.table.insertRow(row)
+                self._row_by_app_id[app_id] = row
 
             name_item = QTableWidgetItem(data.get("name", "N/A"))
             name_item.setData(Qt.ItemDataRole.UserRole, app_id)
@@ -249,6 +274,7 @@ class MainWindow(QMainWindow):
 
         self._prune_table(summary, active_id)
         self.table.setSortingEnabled(True)
+        self._rebuild_row_index()
 
     def _ensure_checkbox(self, row: int, app_id: int, prod: Productivity) -> None:
         widget = self.table.cellWidget(row, 1)
@@ -428,6 +454,11 @@ class MainWindow(QMainWindow):
     def _show_history(self) -> None:
         HistoryDialog(self.db, self).exec()
 
+    def _show_secret_time_dialog(self) -> None:
+        if SecretTimeDialog(self.db, self).exec():
+            self._invoke_worker("refresh_now")
+            self.graph_tab.update_graphs()
+
     def _show_settings(self) -> None:
         dialog = SettingsDialog(self.db, self)
         dialog.settingsChanged.connect(self._apply_settings)
@@ -438,6 +469,11 @@ class MainWindow(QMainWindow):
         self._invoke_worker("set_idle_threshold", Q_ARG(int, threshold))
         self._invoke_worker("reload_settings")
         self._set_guardian(self.db.get_bool(SETTING_GUARDIAN_ENABLED))
+        self._start_telegram_bot()
+
+    def _start_telegram_bot(self) -> None:
+        token = self.db.get_setting(SETTING_TELEGRAM_BOT_TOKEN, "") or ""
+        self.telegram_bot.start(str(token))
 
     def _terminate_app(self, pid: int) -> None:
         if not pid or not psutil.pid_exists(pid):
@@ -531,6 +567,27 @@ class MainWindow(QMainWindow):
             self._show_close_hint()
         super().changeEvent(event)
 
+    def eventFilter(self, source, event) -> bool:
+        if (
+            event.type() == QEvent.Type.KeyPress
+            and QApplication.activeWindow() is self
+            and self._handle_secret_key(event)
+        ):
+            return True
+        return super().eventFilter(source, event)
+
+    def _handle_secret_key(self, event) -> bool:
+        text = event.text().lower()
+        if text and text.isalnum():
+            self._secret_buffer = (self._secret_buffer + text)[-16:]
+            if self._secret_buffer.endswith("67"):
+                self._secret_buffer = ""
+                self._show_secret_time_dialog()
+                return True
+        else:
+            self._secret_buffer = ""
+        return False
+
     def closeEvent(self, event) -> None:
         if self._shutdown_done:
             event.accept()
@@ -548,7 +605,6 @@ class MainWindow(QMainWindow):
             self._show_close_hint()
             return
 
-        # No tray to hide into, so the close button means quit.
         if not self._confirm_exit_password():
             event.ignore()
             return
@@ -590,6 +646,7 @@ class MainWindow(QMainWindow):
         if self._guardian_running:
             self.guardian.stop()
             self._guardian_running = False
+        self.telegram_bot.stop()
         if self.tray_icon:
             self.tray_icon.hide()
 

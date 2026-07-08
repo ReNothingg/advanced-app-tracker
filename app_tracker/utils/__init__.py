@@ -1,5 +1,3 @@
-"""Small, dependency-free helpers."""
-
 from app_tracker.utils.formatting import (
     format_duration,
     friendly_app_name,

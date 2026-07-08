@@ -1,9 +1,3 @@
-"""Cross-platform detection of the current foreground window.
-
-Each platform has a native implementation, with a pygetwindow (title-only)
-fallback. Callers get ``None`` when nothing useful can be determined.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -206,3 +200,4 @@ def get_active_window_info() -> Optional[ActiveWindowInfo]:
         except Exception:
             pass
     return info
+

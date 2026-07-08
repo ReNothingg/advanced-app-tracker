@@ -1,17 +1,18 @@
-"""Modal dialogs: limit editor, password change, settings and history."""
-
 from __future__ import annotations
 
 import logging
+import re
 import sys
+from datetime import datetime
 from typing import Dict, Optional
 
 from PyQt6.QtCore import Qt, QDate, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QIcon
 from PyQt6.QtWidgets import (
-    QCheckBox, QDateEdit, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QSizePolicy,
-    QSpacerItem, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFormLayout,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QSizePolicy, QSpacerItem, QSpinBox, QTableWidget, QTableWidgetItem,
+    QVBoxLayout,
 )
 
 from app_tracker.config import (
@@ -26,6 +27,9 @@ from app_tracker.config import (
     SETTING_PASSWORD_PROTECT_EXIT,
     SETTING_START_MINIMIZED,
     SETTING_TERMINATE_ON_LIMIT,
+    SETTING_TELEGRAM_ADMIN_IDS,
+    SETTING_TELEGRAM_BOT_TOKEN,
+    SETTING_TELEGRAM_LAST_START_AT,
 )
 from app_tracker.core.database import DatabaseManager
 from app_tracker.core.productivity import Productivity
@@ -111,7 +115,7 @@ class PasswordChangeDialog(QDialog):
                 return
 
         new_pwd = self.new_input.text()
-        if not new_pwd:  # empty input offers to drop an existing password
+        if not new_pwd:
             if self.has_password:
                 reply = QMessageBox.question(
                     self, "Удалить пароль", "Удалить пароль на выход?",
@@ -151,6 +155,7 @@ class SettingsDialog(QDialog):
         form = QFormLayout()
         self._build_general(form)
         self._build_limits(form)
+        self._build_telegram(form)
         self._build_security(form)
         layout.addLayout(form)
         layout.addStretch()
@@ -193,6 +198,22 @@ class SettingsDialog(QDialog):
         form.addRow(self._note("Внимание: может привести к потере несохранённых данных."))
         form.addRow(QLabel(" "))
 
+    def _build_telegram(self, form: QFormLayout) -> None:
+        form.addRow(QLabel("<b>Telegram</b>"))
+        self.telegram_token_input = QLineEdit()
+        self.telegram_token_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.telegram_token_input.setPlaceholderText("123456789:AA...")
+        self.telegram_token_input.setText(self.db.get_setting(SETTING_TELEGRAM_BOT_TOKEN, "") or "")
+        form.addRow("Telegram Bot Token:", self.telegram_token_input)
+        self.telegram_admin_ids_input = QLineEdit()
+        self.telegram_admin_ids_input.setPlaceholderText("123456789, 987654321")
+        self.telegram_admin_ids_input.setText(self.db.get_setting(SETTING_TELEGRAM_ADMIN_IDS, "") or "")
+        form.addRow("Admin IDs:", self.telegram_admin_ids_input)
+        form.addRow(self._note(
+            "После сохранения бот запускается автоматически. Команда /start отправит полную статистику."
+        ))
+        form.addRow(QLabel(" "))
+
     def _build_security(self, form: QFormLayout) -> None:
         form.addRow(QLabel("<b>Запуск и защита</b>"))
         self.autorun_cb = QCheckBox("Запускать автоматически при старте Windows")
@@ -225,9 +246,17 @@ class SettingsDialog(QDialog):
             self.password_cb.setChecked(False)
 
     def accept(self) -> None:
-        # Requiring a password makes no sense without one stored.
         if self.password_cb.isChecked() and self.db.get_setting(SETTING_PASSWORD_HASH) is None:
             QMessageBox.warning(self, "Нет пароля", "Сначала установите пароль на выход.")
+            return
+        admin_ids_text = self.telegram_admin_ids_input.text().strip()
+        admin_ids = [item for item in re.split(r"[\s,;]+", admin_ids_text) if item]
+        if any(not item.isdigit() for item in admin_ids):
+            QMessageBox.warning(
+                self,
+                "Telegram Admin IDs",
+                "Admin IDs должны быть числовыми Telegram user id, разделёнными запятыми или пробелами.",
+            )
             return
 
         self.db.set_setting(SETTING_IDLE_THRESHOLD, str(self.idle_spin.value()))
@@ -236,6 +265,8 @@ class SettingsDialog(QDialog):
         self.db.set_bool(SETTING_TERMINATE_ON_LIMIT, self.terminate_cb.isChecked())
         self.db.set_bool(SETTING_GUARDIAN_ENABLED, self.guardian_cb.isChecked())
         self.db.set_bool(SETTING_PASSWORD_PROTECT_EXIT, self.password_cb.isChecked())
+        self.db.set_setting(SETTING_TELEGRAM_BOT_TOKEN, self.telegram_token_input.text().strip())
+        self.db.set_setting(SETTING_TELEGRAM_ADMIN_IDS, ",".join(admin_ids))
 
         if sys.platform == "win32":
             desired = self.autorun_cb.isChecked()
@@ -246,6 +277,125 @@ class SettingsDialog(QDialog):
                     QMessageBox.warning(self, "Автозапуск", "Не удалось обновить автозапуск.")
 
         self.settingsChanged.emit()
+        super().accept()
+
+
+class SecretTimeDialog(QDialog):
+    def __init__(self, db: DatabaseManager, parent=None) -> None:
+        super().__init__(parent)
+        self.db = db
+        self.setWindowTitle("Админка")
+        self.setMinimumWidth(460)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.last_start_label = QLabel(self._format_last_start())
+        self.last_start_label.setWordWrap(True)
+        form.addRow("Последний /start:", self.last_start_label)
+
+        self.app_combo = QComboBox()
+        for app_id, name, path, _productivity in self.db.get_all_apps():
+            self.app_combo.addItem(f"{name} ({path})", app_id)
+        form.addRow("Приложение:", self.app_combo)
+
+        self.date_edit = QDateEdit(calendarPopup=True)
+        self.date_edit.setDate(QDate.currentDate())
+        form.addRow("Дата:", self.date_edit)
+
+        self.current_label = QLabel("N/A")
+        form.addRow("Сейчас записано:", self.current_label)
+
+        self.target_input = QLineEdit()
+        self.target_input.setPlaceholderText("Например: 2ч 15м")
+        form.addRow("Выставить итог:", self.target_input)
+
+        self.delta_input = QLineEdit()
+        self.delta_input.setPlaceholderText("Например: +15м или -5м")
+        form.addRow("Или изменить на:", self.delta_input)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.app_combo.currentIndexChanged.connect(self._refresh_current)
+        self.date_edit.dateChanged.connect(self._refresh_current)
+        self._refresh_current()
+        if self.app_combo.count() == 0:
+            buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
+            self.current_label.setText("Нет приложений в базе")
+
+    def _format_last_start(self) -> str:
+        raw = self.db.get_setting(SETTING_TELEGRAM_LAST_START_AT, "") or ""
+        try:
+            value = datetime.fromisoformat(str(raw))
+        except ValueError:
+            return "Ещё не было"
+
+        seconds_ago = max(0, int((datetime.now() - value).total_seconds()))
+        ago = "только что" if seconds_ago < 5 else f"{format_duration(seconds_ago)} назад"
+        return f"{value.strftime('%d.%m.%Y %H:%M:%S')} ({ago})"
+
+    def _selected_app_id(self) -> Optional[int]:
+        app_id = self.app_combo.currentData()
+        return int(app_id) if app_id is not None else None
+
+    def _selected_date(self):
+        return self.date_edit.date().toPyDate()
+
+    def _refresh_current(self) -> None:
+        app_id = self._selected_app_id()
+        if app_id is None:
+            self.current_label.setText("N/A")
+            return
+        seconds = self.db.get_app_usage_for_date(app_id, self._selected_date())
+        self.current_label.setText(format_duration(seconds))
+
+    def accept(self) -> None:
+        app_id = self._selected_app_id()
+        if app_id is None:
+            return
+
+        target_text = self.target_input.text().strip()
+        delta_text = self.delta_input.text().strip()
+        if bool(target_text) == bool(delta_text):
+            QMessageBox.warning(
+                self,
+                "Неверный ввод",
+                "Заполните либо итоговое время, либо изменение, но не оба поля сразу.",
+            )
+            return
+
+        current = self.db.get_app_usage_for_date(app_id, self._selected_date())
+        if target_text:
+            target = parse_time_input(target_text)
+            if target is None or target < 0:
+                QMessageBox.warning(self, "Неверный ввод", "Формат времени: 2ч 15м, 45м, 30с.")
+                return
+            delta = target - current
+        else:
+            delta = parse_time_input(delta_text)
+            if delta is None:
+                QMessageBox.warning(self, "Неверный ввод", "Формат изменения: +15м или -5м.")
+                return
+
+        if delta == 0:
+            super().accept()
+            return
+
+        applied = self.db.adjust_app_usage_for_date(app_id, self._selected_date(), delta)
+        self._refresh_current()
+        if applied != delta:
+            QMessageBox.information(
+                self,
+                "Готово",
+                f"Применено {format_duration(abs(applied))} из {format_duration(abs(delta))}.",
+            )
         super().accept()
 
 

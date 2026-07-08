@@ -1,10 +1,3 @@
-"""Background tracking worker that runs on its own QThread.
-
-Each tick it finds the foreground app, keeps the open usage-log row current,
-recomputes today/week totals and checks limits. UI calls reach it through the
-``@pyqtSlot`` methods via ``QMetaObject.invokeMethod``.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -35,9 +28,7 @@ _WARN_FRACTION = 0.9
 
 
 class TrackerWorker(QObject):
-    # usage_summary, limits, totals
     usageUpdated = pyqtSignal(dict, dict, dict)
-    # app_id, app_name, kind ("daily"/"daily-warn"/"weekly"/"weekly-warn"), usage, limit
     limitWarning = pyqtSignal(int, str, str, int, int)
     statusChanged = pyqtSignal(str)
     requestTerminateApp = pyqtSignal(int)
@@ -52,6 +43,7 @@ class TrackerWorker(QObject):
 
         self.current_log_id: Optional[int] = None
         self.current_app_id: Optional[int] = None
+        self._current_log_started_at: Optional[datetime] = None
         self._last_app_path: Optional[str] = None
         self._active_pid: Optional[int] = None
 
@@ -62,10 +54,10 @@ class TrackerWorker(QObject):
         self._terminate_requested_at: Dict[int, float] = {}
 
         self._terminate_on_limit = self.db.get_bool(SETTING_TERMINATE_ON_LIMIT)
-        threshold = self.db.get_int(SETTING_IDLE_THRESHOLD, DEFAULT_IDLE_THRESHOLD_SECONDS)
-        # Parent the detector to the worker so its QTimer migrates with us when
-        # the worker is moved to its QThread (Qt warns about cross-thread timers).
-        self.idle_detector = IdleDetector(threshold, parent=self)
+        self._idle_threshold = self.db.get_int(
+            SETTING_IDLE_THRESHOLD, DEFAULT_IDLE_THRESHOLD_SECONDS
+        )
+        self.idle_detector = IdleDetector(self._idle_threshold, parent=self)
         self.idle_detector.idle_changed.connect(self._on_idle_changed)
 
         self._timer = QTimer(self)
@@ -115,6 +107,7 @@ class TrackerWorker(QObject):
 
     @pyqtSlot(int)
     def set_idle_threshold(self, seconds: int) -> None:
+        self._idle_threshold = seconds
         self.idle_detector.set_threshold(seconds)
         self._emit_status(self._status_text())
 
@@ -122,6 +115,10 @@ class TrackerWorker(QObject):
     def reload_settings(self) -> None:
         self._terminate_on_limit = self.db.get_bool(SETTING_TERMINATE_ON_LIMIT)
         log.info("Settings reloaded (terminate_on_limit=%s).", self._terminate_on_limit)
+
+    @pyqtSlot()
+    def refresh_now(self) -> None:
+        self._refresh_summary()
 
     @property
     def is_paused(self) -> bool:
@@ -174,8 +171,12 @@ class TrackerWorker(QObject):
         app_id = self.db.get_or_create_app(name, path)
         if app_id is None:
             return
-        self.current_log_id = self.db.start_usage_log(app_id)
+        started_at = datetime.now()
+        self.current_log_id = self.db.start_usage_log(app_id, started_at)
+        if self.current_log_id is None:
+            return
         self.current_app_id = app_id
+        self._current_log_started_at = started_at
         self._last_app_path = path
         self._active_pid = pid
 
@@ -183,6 +184,7 @@ class TrackerWorker(QObject):
         log_id = self.current_log_id
         self.current_log_id = None
         self.current_app_id = None
+        self._current_log_started_at = None
         self._last_app_path = None
         self._active_pid = None
         if log_id is not None:
@@ -192,7 +194,6 @@ class TrackerWorker(QObject):
         self.usage_summary = self.db.get_usage_summary()
         self.limits = self.db.get_all_limits()
 
-        # Fold the seconds elapsed in the still-open session into "*_display".
         live_seconds = self._current_session_seconds()
         if self.current_app_id is not None:
             entry = self.usage_summary.setdefault(
@@ -219,12 +220,9 @@ class TrackerWorker(QObject):
         self.usageUpdated.emit(self.usage_summary, self.limits, self.totals)
 
     def _current_session_seconds(self) -> int:
-        if self.current_log_id is None:
+        if self.current_log_id is None or self._current_log_started_at is None:
             return 0
-        start = self.db.get_log_start_time(self.current_log_id)
-        if start is None:
-            return 0
-        return max(0, int((datetime.now() - start).total_seconds()))
+        return max(0, int((datetime.now() - self._current_log_started_at).total_seconds()))
 
     def _summary_stub(self, app_id: int) -> Dict[str, Any]:
         details = self.db.get_app_details(app_id)
@@ -277,7 +275,7 @@ class TrackerWorker(QObject):
         if self._paused:
             return "Приостановлено"
         if self._is_idle:
-            return f"Неактивен ({self.db.get_int(SETTING_IDLE_THRESHOLD, DEFAULT_IDLE_THRESHOLD_SECONDS)}с)"
+            return f"Неактивен ({self._idle_threshold}с)"
         if self.current_app_id is not None:
             data = self.usage_summary.get(self.current_app_id)
             if data and data.get("name"):
