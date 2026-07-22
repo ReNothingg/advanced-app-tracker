@@ -455,7 +455,18 @@ class MainWindow(QMainWindow):
         HistoryDialog(self.db, self).exec()
 
     def _show_secret_time_dialog(self) -> None:
-        if SecretTimeDialog(self.db, self).exec():
+        selected_app_id = None
+        selected_rows = self.table.selectionModel().selectedRows()
+        if selected_rows:
+            item = self.table.item(selected_rows[0].row(), 0)
+            if item is not None:
+                selected_app_id = item.data(Qt.ItemDataRole.UserRole)
+
+        if SecretTimeDialog(
+            self.db,
+            self,
+            selected_app_id=selected_app_id,
+        ).exec():
             self._invoke_worker("refresh_now")
             self.graph_tab.update_graphs()
 

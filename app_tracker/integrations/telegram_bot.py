@@ -144,6 +144,10 @@ class TelegramBotService:
             if not self._is_allowed(callback.from_user.id):
                 await callback.answer("Доступ запрещён", show_alert=True)
                 return
+            self.db.set_setting(
+                SETTING_TELEGRAM_LAST_START_AT,
+                datetime.now().isoformat(timespec="seconds"),
+            )
             await callback.answer("Статистика обновляется...")
             chat_id = callback.message.chat.id if callback.message else callback.from_user.id
             await self._send_stats(callback.bot, chat_id)

@@ -281,7 +281,12 @@ class SettingsDialog(QDialog):
 
 
 class SecretTimeDialog(QDialog):
-    def __init__(self, db: DatabaseManager, parent=None) -> None:
+    def __init__(
+        self,
+        db: DatabaseManager,
+        parent=None,
+        selected_app_id: Optional[int] = None,
+    ) -> None:
         super().__init__(parent)
         self.db = db
         self.setWindowTitle("Админка")
@@ -292,11 +297,15 @@ class SecretTimeDialog(QDialog):
 
         self.last_start_label = QLabel(self._format_last_start())
         self.last_start_label.setWordWrap(True)
-        form.addRow("Последний /start:", self.last_start_label)
+        form.addRow("Последняя активность Telegram:", self.last_start_label)
 
         self.app_combo = QComboBox()
         for app_id, name, path, _productivity in self.db.get_all_apps():
             self.app_combo.addItem(f"{name} ({path})", app_id)
+        if selected_app_id is not None:
+            selected_index = self.app_combo.findData(selected_app_id)
+            if selected_index >= 0:
+                self.app_combo.setCurrentIndex(selected_index)
         form.addRow("Приложение:", self.app_combo)
 
         self.date_edit = QDateEdit(calendarPopup=True)
